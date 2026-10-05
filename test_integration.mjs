@@ -501,6 +501,7 @@ async function main() {
   });
 
   // Test 23: Customer Isolation Verification
+  let cust2Token = "";
   await runTest("Customer Cart & Wishlist Isolation Verification", async () => {
     // 1. Customer 1 adds product to cart and wishlist
     await fetch(`${BASE_URL}/customer/cart/items/`, {
@@ -533,7 +534,7 @@ async function main() {
       }),
     });
     const cust2Tokens = await regRes.json();
-    const cust2Token = cust2Tokens.access;
+    cust2Token = cust2Tokens.access;
 
     // 3. Customer 2 queries own cart and wishlist -> must be empty
     const c2CartRes = await fetch(`${BASE_URL}/customer/cart/`, {
@@ -563,10 +564,242 @@ async function main() {
   });
 
   // =================================================================
+  // STEP 6: CHECKOUT & ORDERS VERTICAL SLICE
+  // =================================================================
+
+  let createdOrderPublicId = "";
+  let createdOrderNumber = "";
+
+  // Test 24: Customer Fetches Checkout Preview
+  await runTest("Customer Fetches Authoritative Checkout Preview (/customer/checkout/)", async () => {
+    const res = await fetch(`${BASE_URL}/customer/checkout/`, {
+      headers: { Authorization: `Bearer ${customerAccessToken}` },
+    });
+    assert(res.status === 200, `Expected 200 OK for checkout preview but got ${res.status}`);
+    const data = await res.json();
+    assert(data.is_ready_for_checkout === true, "Checkout should be ready with valid items");
+    assert(data.subtotal === "84.00", `Expected subtotal '84.00' (42.00 * 2) but got ${data.subtotal}`);
+    assert(data.total === "84.00", `Expected total '84.00' but got ${data.total}`);
+    assert(data.shipping_cost === "0.00", "Shipping cost should be 0.00");
+    assert(data.customer?.email, "Customer email must be populated");
+  });
+
+  // Test 25: Customer Places Order from Cart
+  await runTest("Customer Submits Valid Order Creation (/customer/orders/)", async () => {
+    const res = await fetch(`${BASE_URL}/customer/orders/`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${customerAccessToken}`,
+      },
+      body: JSON.stringify({
+        shipping_address: {
+          full_name: "Jane Doe Integration",
+          phone: "+8801700000000",
+          address: "House 10, Road 4, Sector 3",
+          city: "Dhaka",
+          area: "Uttara",
+          postal_code: "1230",
+          country: "Bangladesh",
+        },
+        customer_notes: "Leave package at front reception",
+      }),
+    });
+    assert(res.status === 201, `Expected 201 Created for order placement but got ${res.status}`);
+    const data = await res.json();
+
+    assert(data.public_id, "Order must have public_id (UUID)");
+    assert(data.order_number?.startsWith("LUM-"), `Order number must follow LUM- convention, got: ${data.order_number}`);
+    assert(data.status === "pending", `Expected order status 'pending' but got: ${data.status}`);
+    assert(data.payment_status === "pending", `Expected payment status 'pending' but got: ${data.payment_status}`);
+    assert(data.subtotal === "84.00", `Expected subtotal '84.00' but got: ${data.subtotal}`);
+    assert(data.total === "84.00", `Expected total '84.00' but got: ${data.total}`);
+
+    // Snapshot verification
+    assert(Array.isArray(data.items) && data.items.length === 1, "Expected 1 order item");
+    const item = data.items[0];
+    assert(item.product_name === "Luminous Glow Facial Oil", `Expected snapshotted name but got: ${item.product_name}`);
+    assert(item.product_sku === productSku, `Expected snapshotted SKU but got: ${item.product_sku}`);
+    assert(item.unit_price === "42.00", `Expected snapshotted unit price '42.00' but got: ${item.unit_price}`);
+    assert(item.quantity === 2, `Expected quantity 2 but got: ${item.quantity}`);
+    assert(item.line_total === "84.00", `Expected line total '84.00' but got: ${item.line_total}`);
+
+    // Shipping address snapshot verification
+    assert(data.shipping_address?.full_name === "Jane Doe Integration", "Full name must match snapshot");
+    assert(data.shipping_address?.city === "Dhaka", "City must match snapshot");
+    assert(data.customer_notes === "Leave package at front reception", "Notes must match");
+
+    createdOrderPublicId = data.public_id;
+    createdOrderNumber = data.order_number;
+  });
+
+  // Test 26: Cart Cleared & Inventory Deducted
+  await runTest("Cart Is Cleared and Inventory Deducted Atomically After Checkout", async () => {
+    // 1. Verify Cart is empty
+    const cartRes = await fetch(`${BASE_URL}/customer/cart/`, {
+      headers: { Authorization: `Bearer ${customerAccessToken}` },
+    });
+    const cartData = await cartRes.json();
+    assert(cartData.item_count === 0, `Cart should be empty after checkout, got: ${cartData.item_count}`);
+    assert(cartData.items.length === 0, "Cart items array should be empty");
+
+    // 2. Verify product stock deducted by 2 (initial was 20, now 18)
+    const prodRes = await fetch(`${BASE_URL}/storefront/products/${productSlug}/`);
+    const prodData = await prodRes.json();
+    assert(prodData.stock_quantity === 18, `Expected stock 18 (20 - 2) but got: ${prodData.stock_quantity}`);
+  });
+
+  // Test 27: Customer Order List & Detail Retrieval
+  await runTest("Customer Order History & Detail Retrieval with Purchase Snapshots", async () => {
+    // 1. List
+    const listRes = await fetch(`${BASE_URL}/customer/orders/`, {
+      headers: { Authorization: `Bearer ${customerAccessToken}` },
+    });
+    assert(listRes.status === 200, `Expected 200 OK for customer orders list but got ${listRes.status}`);
+    const listData = await listRes.json();
+    assert(listData.count >= 1, "Expected at least 1 order in customer history");
+    const found = listData.results?.some((ord) => ord.public_id === createdOrderPublicId);
+    assert(found, `Newly created order ${createdOrderPublicId} not found in order list`);
+
+    // 2. Detail
+    const detailRes = await fetch(`${BASE_URL}/customer/orders/${createdOrderPublicId}/`, {
+      headers: { Authorization: `Bearer ${customerAccessToken}` },
+    });
+    assert(detailRes.status === 200, `Expected 200 OK for customer order detail but got ${detailRes.status}`);
+    const detailData = await detailRes.json();
+    assert(detailData.order_number === createdOrderNumber, "Order numbers must match");
+    assert(detailData.items[0].unit_price === "42.00", "Snapshotted price must match");
+  });
+
+  // Test 28: Customer Order Isolation Enforcement
+  await runTest("Customer Order Isolation (Customer B Cannot Access Customer A's Orders)", async () => {
+    // Customer 2 attempts to retrieve Customer 1's order
+    const res = await fetch(`${BASE_URL}/customer/orders/${createdOrderPublicId}/`, {
+      headers: { Authorization: `Bearer ${cust2Token}` },
+    });
+    assert(res.status === 404, `Expected 404 Not Found for cross-customer order access but got ${res.status}`);
+
+    // Customer 2 lists orders: must be 0
+    const listRes = await fetch(`${BASE_URL}/customer/orders/`, {
+      headers: { Authorization: `Bearer ${cust2Token}` },
+    });
+    const listData = await listRes.json();
+    assert(listData.count === 0, `Customer 2 order list should have 0 orders, got: ${listData.count}`);
+  });
+
+  // Test 29: Historical Price Immutability
+  await runTest("Historical Price Immutability (Catalog Price Changes Never Alter Existing Orders)", async () => {
+    // Staff changes price from 50.00/42.00 to 99.00
+    await fetch(`${BASE_URL}/admin/products/${productId}/`, {
+      method: "PATCH",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${staffAccessToken}`,
+      },
+      body: JSON.stringify({
+        price: "99.00",
+        discount_price: null,
+      }),
+    });
+
+    // Customer retrieves past order detail
+    const res = await fetch(`${BASE_URL}/customer/orders/${createdOrderPublicId}/`, {
+      headers: { Authorization: `Bearer ${customerAccessToken}` },
+    });
+    const data = await res.json();
+    assert(data.items[0].unit_price === "42.00", `Old order item unit price must remain 42.00, got: ${data.items[0].unit_price}`);
+    assert(data.items[0].line_total === "84.00", `Old order line total must remain 84.00, got: ${data.items[0].line_total}`);
+    assert(data.total === "84.00", `Old order total must remain 84.00, got: ${data.total}`);
+  });
+
+  // Test 30: Insufficient Stock Checkout Rejection & Atomicity
+  await runTest("Insufficient Stock Checkout Rejection & Transaction Atomicity (409 Conflict)", async () => {
+    // 1. Customer adds 10 units to cart
+    await fetch(`${BASE_URL}/customer/cart/items/`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${customerAccessToken}`,
+      },
+      body: JSON.stringify({ product_id: productPublicId, quantity: 10 }),
+    });
+
+    // 2. Staff adjusts product stock to 5 in CMS
+    await fetch(`${BASE_URL}/admin/products/${productId}/`, {
+      method: "PATCH",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${staffAccessToken}`,
+      },
+      body: JSON.stringify({ stock_quantity: 5 }),
+    });
+
+    // 3. Customer attempts checkout -> must fail with 409 insufficient_stock
+    const res = await fetch(`${BASE_URL}/customer/orders/`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${customerAccessToken}`,
+      },
+      body: JSON.stringify({
+        shipping_address: {
+          full_name: "Jane Doe Integration",
+          phone: "+8801700000000",
+          address: "House 10, Road 4",
+          city: "Dhaka",
+        },
+      }),
+    });
+    assert(res.status === 409, `Expected 409 Conflict for insufficient stock but got ${res.status}`);
+    const errData = await res.json();
+    assert(errData.error?.code === "insufficient_stock", `Expected code 'insufficient_stock' but got ${errData.error?.code}`);
+
+    // 4. Verify atomicity: stock remains 5, cart remains intact with 10 items
+    const stockRes = await fetch(`${BASE_URL}/storefront/products/${productSlug}/`);
+    const stockData = await stockRes.json();
+    assert(stockData.stock_quantity === 5, "Stock must remain 5 after aborted transaction");
+
+    const cartRes = await fetch(`${BASE_URL}/customer/cart/`, {
+      headers: { Authorization: `Bearer ${customerAccessToken}` },
+    });
+    const cartData = await cartRes.json();
+    assert(cartData.item_count === 10, "Cart must remain intact with 10 items");
+
+    // 5. Clean up cart
+    await fetch(`${BASE_URL}/customer/cart/`, {
+      method: "DELETE",
+      headers: { Authorization: `Bearer ${customerAccessToken}` },
+    });
+  });
+
+  // Test 31: CMS Staff Operational Orders Visibility
+  await runTest("CMS Staff Operational Order Listing & Detail (/admin/orders/)", async () => {
+    // 1. Staff lists orders
+    const listRes = await fetch(`${BASE_URL}/admin/orders/`, {
+      headers: { Authorization: `Bearer ${staffAccessToken}` },
+    });
+    assert(listRes.status === 200, `Expected 200 OK for admin orders list but got ${listRes.status}`);
+    const listData = await listRes.json();
+    assert(listData.count >= 1, "Expected at least 1 order in admin view");
+    const found = listData.results?.some((ord) => ord.public_id === createdOrderPublicId);
+    assert(found, "Order must be visible to staff");
+
+    // 2. Staff views order detail
+    const detailRes = await fetch(`${BASE_URL}/admin/orders/${createdOrderPublicId}/`, {
+      headers: { Authorization: `Bearer ${staffAccessToken}` },
+    });
+    assert(detailRes.status === 200, `Expected 200 OK for admin order detail but got ${detailRes.status}`);
+    const detailData = await detailRes.json();
+    assert(detailData.customer?.email, "Staff detail must include customer profile info");
+    assert(detailData.items?.length === 1, "Line items must be present in staff detail");
+    assert(Array.isArray(detailData.status_history), "Status history must be present in staff detail");
+  });
+
+  // =================================================================
   // CATALOG ARCHIVING & BR-05 CHECKS
   // =================================================================
 
-  // Test 24: BR-05 Category Archive Conflict with Active Products
+  // Test 32: BR-05 Category Archive Conflict with Active Products
   await runTest("BR-05: Cannot Archive Category with Active Products (409 Conflict)", async () => {
     const res = await fetch(`${BASE_URL}/admin/categories/${categoryId}/`, {
       method: "DELETE",
@@ -577,7 +810,7 @@ async function main() {
     assert(data.error?.code === "conflict", `Expected conflict code but got '${data.error?.code}'`);
   });
 
-  // Test 25: Staff Archives Product
+  // Test 33: Staff Archives Product
   await runTest("Staff Archives Product via CMS (/admin/products/{id}/)", async () => {
     const res = await fetch(`${BASE_URL}/admin/products/${productId}/`, {
       method: "DELETE",
@@ -586,13 +819,13 @@ async function main() {
     assert(res.status === 204, `Expected 204 No Content for product archive but got ${res.status}`);
   });
 
-  // Test 26: Storefront Hides Archived Product (404)
+  // Test 34: Storefront Hides Archived Product (404)
   await runTest("Storefront Hides Archived Product (/storefront/products/{slug}/ -> 404)", async () => {
     const res = await fetch(`${BASE_URL}/storefront/products/${productSlug}/`);
     assert(res.status === 404, `Expected 404 Not Found for archived product but got ${res.status}`);
   });
 
-  // Test 27: Staff Can Now Archive Category
+  // Test 35: Staff Can Now Archive Category
   await runTest("Staff Archives Category After Products Reassigned/Archived", async () => {
     const res = await fetch(`${BASE_URL}/admin/categories/${categoryId}/`, {
       method: "DELETE",
