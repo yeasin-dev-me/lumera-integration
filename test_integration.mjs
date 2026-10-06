@@ -796,10 +796,124 @@ async function main() {
   });
 
   // =================================================================
+  // STEP 7 — PAYMENTS VERTICAL SLICE
+  // =================================================================
+  let createdPaymentPublicId = "";
+
+  // Test 32: Authoritative Payment Status Query for Payable Order
+  await runTest("Authoritative Payment Status Query for Payable Order (/customer/orders/{id}/payment/)", async () => {
+    const res = await fetch(`${BASE_URL}/customer/orders/${createdOrderPublicId}/payment/`, {
+      headers: { Authorization: `Bearer ${customerAccessToken}` },
+    });
+    assert(res.status === 200, `Expected 200 OK for payment status query but got ${res.status}`);
+    const data = await res.json();
+    assert(data.order_public_id === createdOrderPublicId, "Order public ID must match");
+    assert(data.status === "pending", `Expected status 'pending', got '${data.status}'`);
+    assert(data.amount === "84.00", `Expected amount '84.00', got '${data.amount}'`);
+    assert(data.currency === "USD", `Expected currency 'USD', got '${data.currency}'`);
+  });
+
+  // Test 33: Security — Unauthenticated User Cannot Initiate Payment
+  await runTest("Security: Unauthenticated User Cannot Initiate Payment (401 Unauthorized)", async () => {
+    const res = await fetch(`${BASE_URL}/customer/orders/${createdOrderPublicId}/payment/`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ gateway: "sslcommerz" }),
+    });
+    assert(res.status === 401, `Expected 401 Unauthorized but got ${res.status}`);
+  });
+
+  // Test 34: Customer Isolation — Customer B Cannot Initiate Payment for Customer A's Order
+  await runTest("Customer Isolation: Customer B Cannot Initiate Payment for Customer A's Order (404 Not Found)", async () => {
+    const res = await fetch(`${BASE_URL}/customer/orders/${createdOrderPublicId}/payment/`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${cust2Token}`,
+      },
+      body: JSON.stringify({ gateway: "sslcommerz" }),
+    });
+    assert(res.status === 404, `Expected 404 Not Found for cross-customer payment initiation but got ${res.status}`);
+
+    const getRes = await fetch(`${BASE_URL}/customer/orders/${createdOrderPublicId}/payment/`, {
+      headers: { Authorization: `Bearer ${cust2Token}` },
+    });
+    assert(getRes.status === 404, `Expected 404 Not Found for cross-customer payment query but got ${getRes.status}`);
+  });
+
+  // Test 35: Authenticated Customer Initiates Payment Session with Authoritative Order Total
+  await runTest("Customer Initiates Payment Session with Authoritative Order Total (/customer/orders/{id}/payment/)", async () => {
+    const res = await fetch(`${BASE_URL}/customer/orders/${createdOrderPublicId}/payment/`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${customerAccessToken}`,
+      },
+      body: JSON.stringify({ gateway: "sslcommerz" }),
+    });
+    assert(res.status === 201, `Expected 201 Created for payment initiation but got ${res.status}`);
+    const data = await res.json();
+    assert(data.payment_public_id, "Response must include payment_public_id");
+    assert(data.order_public_id === createdOrderPublicId, "Order public_id must match");
+    assert(data.amount === "84.00", `Expected authoritative amount '84.00' but got '${data.amount}'`);
+    assert(data.currency === "USD", `Expected currency 'USD' but got '${data.currency}'`);
+    assert(data.status === "initiated", `Expected status 'initiated' but got '${data.status}'`);
+    assert(data.redirect_url && data.redirect_url.includes("sslcommerz.com"), "Redirect URL must point to SSLCommerz gateway");
+    createdPaymentPublicId = data.payment_public_id;
+  });
+
+  // Test 36: Security — Webhook Rejects Unknown Transaction Reference
+  await runTest("Security: Webhook Rejects Unknown Transaction Reference (400 Bad Request)", async () => {
+    const res = await fetch(`${BASE_URL}/internal/payments/webhook/sslcommerz/`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        tran_id: "00000000-0000-0000-0000-000000000000",
+        val_id: "NON_EXISTENT_VAL_ID",
+      }),
+    });
+    assert(res.status === 400, `Expected 400 Bad Request for unknown transaction callback but got ${res.status}`);
+  });
+
+  // Test 37: Security — Webhook Server-Side Verification Rejects Unverified Transaction
+  await runTest("Security: Webhook Server-Side Verification Rejects Unverified Transaction (Safe Failure)", async () => {
+    const res = await fetch(`${BASE_URL}/internal/payments/webhook/sslcommerz/`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        tran_id: createdPaymentPublicId,
+        val_id: "FAKE_UNVERIFIED_VAL_ID",
+      }),
+    });
+    const data = await res.json();
+    assert(data.status === "failed", `Expected status 'failed' for unverified callback, got: ${data.status}`);
+
+    // Verify order remains unpaid
+    const ordRes = await fetch(`${BASE_URL}/customer/orders/${createdOrderPublicId}/`, {
+      headers: { Authorization: `Bearer ${customerAccessToken}` },
+    });
+    const ordData = await ordRes.json();
+    assert(ordData.payment_status === "pending", `Order payment status must remain pending, got: ${ordData.payment_status}`);
+  });
+
+  // Test 38: CMS Staff Payment Visibility and Attempt Audit Trail
+  await runTest("CMS Staff Payment Visibility and Attempt Audit Trail (/admin/orders/{id}/)", async () => {
+    const res = await fetch(`${BASE_URL}/admin/orders/${createdOrderPublicId}/`, {
+      headers: { Authorization: `Bearer ${staffAccessToken}` },
+    });
+    assert(res.status === 200, `Expected 200 OK for admin order detail but got ${res.status}`);
+    const data = await res.json();
+    assert(data.payment, "Staff order detail must include payment object");
+    assert(data.payment.gateway === "sslcommerz", "Payment gateway must be 'sslcommerz'");
+    assert(Array.isArray(data.payment_attempts), "Payment attempts must be an array");
+    assert(data.payment_attempts.length >= 1, "At least one payment attempt must be recorded");
+  });
+
+  // =================================================================
   // CATALOG ARCHIVING & BR-05 CHECKS
   // =================================================================
 
-  // Test 32: BR-05 Category Archive Conflict with Active Products
+  // Test 39: BR-05 Category Archive Conflict with Active Products
   await runTest("BR-05: Cannot Archive Category with Active Products (409 Conflict)", async () => {
     const res = await fetch(`${BASE_URL}/admin/categories/${categoryId}/`, {
       method: "DELETE",
@@ -810,7 +924,7 @@ async function main() {
     assert(data.error?.code === "conflict", `Expected conflict code but got '${data.error?.code}'`);
   });
 
-  // Test 33: Staff Archives Product
+  // Test 40: Staff Archives Product
   await runTest("Staff Archives Product via CMS (/admin/products/{id}/)", async () => {
     const res = await fetch(`${BASE_URL}/admin/products/${productId}/`, {
       method: "DELETE",
@@ -819,13 +933,13 @@ async function main() {
     assert(res.status === 204, `Expected 204 No Content for product archive but got ${res.status}`);
   });
 
-  // Test 34: Storefront Hides Archived Product (404)
+  // Test 41: Storefront Hides Archived Product (404)
   await runTest("Storefront Hides Archived Product (/storefront/products/{slug}/ -> 404)", async () => {
     const res = await fetch(`${BASE_URL}/storefront/products/${productSlug}/`);
     assert(res.status === 404, `Expected 404 Not Found for archived product but got ${res.status}`);
   });
 
-  // Test 35: Staff Can Now Archive Category
+  // Test 42: Staff Can Now Archive Category
   await runTest("Staff Archives Category After Products Reassigned/Archived", async () => {
     const res = await fetch(`${BASE_URL}/admin/categories/${categoryId}/`, {
       method: "DELETE",
