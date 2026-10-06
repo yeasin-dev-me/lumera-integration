@@ -1,41 +1,20 @@
 /**
  * Integration Test Suite for Lumera Platform
- * STEP 5 — CART & WISHLIST VERTICAL SLICE
+ * STEP 8 — FULFILLMENT, ORDER LIFECYCLE & NOTIFICATIONS VERTICAL SLICE
  *
- * Verifies that:
- * 1. Health & Public Config endpoints respond normally.
- * 2. Customer registration, login, JWT rotation operate properly.
- * 3. Staff CMS login returns staff user and advisory permissions.
- * 4. Staff creates a Category via /admin/categories/ with backend validation.
- * 5. Backend authoritatively rejects invalid product prices (< 0) and stock (< 0).
- * 6. Staff creates a Product via /admin/products/ with prices, stock, and images.
- * 7. Duplicate SKU is authoritatively rejected by backend.
- * 8. Customer Storefront queries /storefront/categories/ and sees newly created Category.
- * 9. Customer Storefront queries /storefront/products/ and sees published Product with
- *    backend-calculated effective_price and real-time inventory stock.
- * 10. Customer Storefront queries /storefront/products/{slug}/ for product detail.
- * 11. Customer retrieves empty cart (/customer/cart/).
- * 12. Customer adds product to cart with authoritative backend pricing (/customer/cart/items/).
- * 13. Customer updates cart line quantity (/customer/cart/items/{product_id}/).
- * 14. Backend rejects cart quantity exceeding available stock (409 insufficient_stock).
- * 15. Customer adds same product again; backend increments quantity authoritatively.
- * 16. Customer removes cart item (/customer/cart/items/{product_id}/ -> 204).
- * 17. Customer clears cart (/customer/cart/ -> 204).
- * 18. Customer retrieves empty wishlist (/customer/wishlist/).
- * 19. Customer adds product to wishlist (/customer/wishlist/items/).
- * 20. Backend rejects duplicate wishlist item (409 conflict).
- * 21. Customer removes item from wishlist (/customer/wishlist/items/{product_id}/ -> 204).
- * 22. Customer cart and wishlist isolation (Customer B cannot view or mutate Customer A's data).
- * 23. BR-05: Category containing active products cannot be archived without reassigning them.
- * 24. Staff archives product via CMS.
- * 25. Storefront hides archived product (returns 404).
- * 26. Staff archives category after products reassigned/archived.
+ * Verifies the end-to-end multi-app integration flow across:
+ * - Auth, Storefront, Catalog
+ * - Cart & Wishlist
+ * - Checkout, Stock Deduction & Historical Immutability
+ * - Payments (SSLCommerz gateway, verification, idempotent webhooks)
+ * - Fulfillment & Order Lifecycle (Transitions, Tracking, Customer Cancellation with Stock Restoration)
+ * - Audit History, Customer Isolation, and Catalog Archiving (BR-05)
  */
 
 const BASE_URL = process.env.API_BASE_URL || "http://127.0.0.1:8000/api/v1";
 
 console.log(`\n==================================================================`);
-console.log(` LUMERA INTEGRATION SUITE: Cart & Wishlist Vertical Slice`);
+console.log(` LUMERA INTEGRATION SUITE: Fulfillment, Lifecycle & Payments Slice`);
 console.log(` Target Backend API: ${BASE_URL}`);
 console.log(`==================================================================\n`);
 
@@ -910,10 +889,245 @@ async function main() {
   });
 
   // =================================================================
+  // STEP 8 — FULFILLMENT, ORDER LIFECYCLE & NOTIFICATIONS
+  // =================================================================
+
+  // Test 39: Customer Isolation — Customer B Cannot Cancel Customer A's Order
+  await runTest("Customer Isolation: Customer B Cannot Cancel Customer A's Order (404 Not Found)", async () => {
+    const res = await fetch(`${BASE_URL}/customer/orders/${createdOrderPublicId}/cancel/`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${cust2Token}`,
+      },
+      body: JSON.stringify({ reason: "Unauthorized attempt" }),
+    });
+    assert(res.status === 404, `Expected 404 Not Found for cross-customer order cancellation but got ${res.status}`);
+  });
+
+  // Test 40: Customer Cancels Unpaid Pending Order with Atomic Stock Restoration
+  await runTest("Customer Cancels Unpaid Pending Order with Atomic Stock Restoration (/customer/orders/{id}/cancel/)", async () => {
+    // 1. Verify stock before cancellation (adjusted to 5 in Test 30)
+    const beforeRes = await fetch(`${BASE_URL}/storefront/products/${productSlug}/`);
+    const beforeData = await beforeRes.json();
+    const stockBefore = beforeData.stock_quantity;
+    assert(stockBefore === 5, `Expected stock to be 5 before cancellation, got: ${stockBefore}`);
+
+    // 2. Customer cancels order (had 2 units of product)
+    const cancelRes = await fetch(`${BASE_URL}/customer/orders/${createdOrderPublicId}/cancel/`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${customerAccessToken}`,
+      },
+      body: JSON.stringify({ reason: "Found a better deal" }),
+    });
+    assert(cancelRes.status === 200, `Expected 200 OK for order cancellation but got ${cancelRes.status}`);
+    const cancelData = await cancelRes.json();
+    assert(cancelData.status === "cancelled", `Expected status 'cancelled' but got '${cancelData.status}'`);
+
+    // 3. Verify stock restored by exactly 2 units (5 + 2 = 7)
+    const afterRes = await fetch(`${BASE_URL}/storefront/products/${productSlug}/`);
+    const afterData = await afterRes.json();
+    assert(afterData.stock_quantity === stockBefore + 2, `Expected stock restored to ${stockBefore + 2}, got: ${afterData.stock_quantity}`);
+  });
+
+  // Test 41: Guard — Repeated Order Cancellation Rejection (409 Conflict)
+  await runTest("Guard: Repeated Order Cancellation Rejection (409 Conflict)", async () => {
+    const res = await fetch(`${BASE_URL}/customer/orders/${createdOrderPublicId}/cancel/`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${customerAccessToken}`,
+      },
+      body: JSON.stringify({ reason: "Cancel again" }),
+    });
+    assert(res.status === 409, `Expected 409 Conflict when cancelling already cancelled order, got ${res.status}`);
+  });
+
+  // Test 42: Customer Places Second Order & Completes Payment for Fulfillment
+  let fulfillmentOrderId = "";
+  await runTest("Customer Places Second Order & Completes Payment for Fulfillment", async () => {
+    // 1. Add 1 item to cart
+    await fetch(`${BASE_URL}/customer/cart/items/`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${customerAccessToken}`,
+      },
+      body: JSON.stringify({ product_id: productPublicId, quantity: 1 }),
+    });
+
+    // 2. Checkout
+    const res = await fetch(`${BASE_URL}/customer/orders/`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${customerAccessToken}`,
+      },
+      body: JSON.stringify({
+        shipping_address: {
+          full_name: "Jane Doe Fulfillment",
+          phone: "+8801700000001",
+          address: "House 25, Road 7",
+          city: "Dhaka",
+        },
+      }),
+    });
+    assert(res.status === 201, `Expected 201 Created for order 2 but got ${res.status}`);
+    const data = await res.json();
+    fulfillmentOrderId = data.public_id;
+    assert(data.status === "pending", `Expected order 2 status 'pending', got: ${data.status}`);
+
+    // 3. Initiate payment
+    const payRes = await fetch(`${BASE_URL}/customer/orders/${fulfillmentOrderId}/payment/`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${customerAccessToken}`,
+      },
+      body: JSON.stringify({ gateway: "sslcommerz" }),
+    });
+    assert(payRes.status === 201, `Expected 201 Created for payment session, got ${payRes.status}`);
+    const payData = await payRes.json();
+
+    // 4. Server-to-server webhook authoritatively confirms payment
+    const webhookRes = await fetch(`${BASE_URL}/internal/payments/webhook/sslcommerz/`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        tran_id: payData.payment_public_id,
+        val_id: "TEST_VALID_STEP8_SUCCESS",
+      }),
+    });
+    assert(webhookRes.status === 200, `Expected 200 OK for payment webhook, got ${webhookRes.status}`);
+    const webhookData = await webhookRes.json();
+    assert(webhookData.status === "paid", `Expected status 'paid', got: ${webhookData.status} - message: ${webhookData.message}`);
+  });
+
+  // Test 43: Staff Starts Processing Confirmed Paid Order (/admin/orders/{id}/transition/)
+  await runTest("Staff Starts Processing Confirmed Paid Order (/admin/orders/{id}/transition/)", async () => {
+    const procRes = await fetch(`${BASE_URL}/admin/orders/${fulfillmentOrderId}/transition/`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${staffAccessToken}`,
+      },
+      body: JSON.stringify({ to_status: "processing", reason: "Allocated to packing station" }),
+    });
+    assert(procRes.status === 200, `Expected 200 OK for transition to processing but got ${procRes.status}`);
+    const procData = await procRes.json();
+    assert(procData.status === "processing", `Expected status 'processing', got: ${procData.status}`);
+  });
+
+  // Test 44: Guard — Shipping Rejects Missing Courier & Tracking Number
+  await runTest("Guard: Shipping Rejects Missing Courier & Tracking Number (400 Bad Request)", async () => {
+    const res = await fetch(`${BASE_URL}/admin/orders/${fulfillmentOrderId}/transition/`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${staffAccessToken}`,
+      },
+      body: JSON.stringify({ to_status: "shipped", reason: "Attempt dispatch without tracking" }),
+    });
+    assert(res.status === 400, `Expected 400 Bad Request when dispatching without tracking but got ${res.status}`);
+  });
+
+  // Test 45: Staff Updates Fulfillment Tracking Metadata (/admin/orders/{id}/fulfillment/)
+  await runTest("Staff Updates Fulfillment Tracking Metadata (/admin/orders/{id}/fulfillment/)", async () => {
+    const res = await fetch(`${BASE_URL}/admin/orders/${fulfillmentOrderId}/fulfillment/`, {
+      method: "PATCH",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${staffAccessToken}`,
+      },
+      body: JSON.stringify({
+        courier: "Pathao Express",
+        tracking_number: "PTH-998877",
+        tracking_url: "https://tracking.pathao.com/PTH-998877",
+      }),
+    });
+    assert(res.status === 200, `Expected 200 OK for fulfillment update but got ${res.status}`);
+    const data = await res.json();
+    assert(data.courier === "Pathao Express", `Expected courier 'Pathao Express', got: ${data.courier}`);
+    assert(data.tracking_number === "PTH-998877", `Expected tracking_number 'PTH-998877', got: ${data.tracking_number}`);
+    assert(data.tracking_url === "https://tracking.pathao.com/PTH-998877", `Expected tracking_url, got: ${data.tracking_url}`);
+  });
+
+  // Test 46: Staff Transitions Order to Shipped and Delivered
+  await runTest("Staff Transitions Order to Shipped and Delivered (/admin/orders/{id}/transition/)", async () => {
+    // 1. Transition processing -> shipped
+    const shipRes = await fetch(`${BASE_URL}/admin/orders/${fulfillmentOrderId}/transition/`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${staffAccessToken}`,
+      },
+      body: JSON.stringify({ to_status: "shipped", reason: "Picked up by courier" }),
+    });
+    assert(shipRes.status === 200, `Expected 200 OK for transition to shipped but got ${shipRes.status}`);
+    const shipData = await shipRes.json();
+    assert(shipData.status === "shipped", `Expected status 'shipped', got: ${shipData.status}`);
+    assert(shipData.shipped_at !== null, "Expected shipped_at timestamp to be populated");
+
+    // 2. Transition shipped -> delivered
+    const delRes = await fetch(`${BASE_URL}/admin/orders/${fulfillmentOrderId}/transition/`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${staffAccessToken}`,
+      },
+      body: JSON.stringify({ to_status: "delivered", reason: "Customer received shipment" }),
+    });
+    assert(delRes.status === 200, `Expected 200 OK for transition to delivered but got ${delRes.status}`);
+    const delData = await delRes.json();
+    assert(delData.status === "delivered", `Expected status 'delivered', got: ${delData.status}`);
+    assert(delData.delivered_at !== null, "Expected delivered_at timestamp to be populated");
+  });
+
+  // Test 47: Guard — Delivered Terminal State Cannot Transition
+  await runTest("Guard: Terminal State Cannot Transition (409 Conflict)", async () => {
+    const res = await fetch(`${BASE_URL}/admin/orders/${fulfillmentOrderId}/transition/`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${staffAccessToken}`,
+      },
+      body: JSON.stringify({ to_status: "processing", reason: "Illegal back-transition" }),
+    });
+    assert(res.status === 409, `Expected 409 Conflict for terminal transition but got ${res.status}`);
+  });
+
+  // Test 48: Customer Order Timeline Retrieval and Customer Isolation
+  await runTest("Customer Order Timeline Retrieval and Customer Isolation (/customer/orders/{id}/timeline/)", async () => {
+    // 1. Customer A retrieves timeline
+    const res = await fetch(`${BASE_URL}/customer/orders/${fulfillmentOrderId}/timeline/`, {
+      headers: { Authorization: `Bearer ${customerAccessToken}` },
+    });
+    assert(res.status === 200, `Expected 200 OK for customer timeline query but got ${res.status}`);
+    const items = await res.json();
+    assert(Array.isArray(items), "Timeline response must be an array");
+    assert(items.length >= 4, `Expected at least 4 timeline events, got: ${items.length}`);
+    const statuses = items.map((i) => i.to_status);
+    assert(statuses.includes("confirmed"), "Timeline must contain confirmed status");
+    assert(statuses.includes("processing"), "Timeline must contain processing status");
+    assert(statuses.includes("shipped"), "Timeline must contain shipped status");
+    assert(statuses.includes("delivered"), "Timeline must contain delivered status");
+    // Verify actor_type field present
+    assert(items.every((i) => typeof i.actor_type === "string"), "Every timeline item must provide actor_type");
+
+    // 2. Customer B attempts to retrieve Customer A's timeline -> 404
+    const isoRes = await fetch(`${BASE_URL}/customer/orders/${fulfillmentOrderId}/timeline/`, {
+      headers: { Authorization: `Bearer ${cust2Token}` },
+    });
+    assert(isoRes.status === 404, `Expected 404 Not Found for cross-customer timeline query but got ${isoRes.status}`);
+  });
+
+  // =================================================================
   // CATALOG ARCHIVING & BR-05 CHECKS
   // =================================================================
 
-  // Test 39: BR-05 Category Archive Conflict with Active Products
+  // Test 49: BR-05 Category Archive Conflict with Active Products
   await runTest("BR-05: Cannot Archive Category with Active Products (409 Conflict)", async () => {
     const res = await fetch(`${BASE_URL}/admin/categories/${categoryId}/`, {
       method: "DELETE",
@@ -924,7 +1138,7 @@ async function main() {
     assert(data.error?.code === "conflict", `Expected conflict code but got '${data.error?.code}'`);
   });
 
-  // Test 40: Staff Archives Product
+  // Test 50: Staff Archives Product
   await runTest("Staff Archives Product via CMS (/admin/products/{id}/)", async () => {
     const res = await fetch(`${BASE_URL}/admin/products/${productId}/`, {
       method: "DELETE",
@@ -933,13 +1147,13 @@ async function main() {
     assert(res.status === 204, `Expected 204 No Content for product archive but got ${res.status}`);
   });
 
-  // Test 41: Storefront Hides Archived Product (404)
+  // Test 51: Storefront Hides Archived Product (404)
   await runTest("Storefront Hides Archived Product (/storefront/products/{slug}/ -> 404)", async () => {
     const res = await fetch(`${BASE_URL}/storefront/products/${productSlug}/`);
     assert(res.status === 404, `Expected 404 Not Found for archived product but got ${res.status}`);
   });
 
-  // Test 42: Staff Can Now Archive Category
+  // Test 52: Staff Can Now Archive Category
   await runTest("Staff Archives Category After Products Reassigned/Archived", async () => {
     const res = await fetch(`${BASE_URL}/admin/categories/${categoryId}/`, {
       method: "DELETE",
