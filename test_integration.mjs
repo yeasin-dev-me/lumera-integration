@@ -1124,6 +1124,143 @@ async function main() {
   });
 
   // =================================================================
+  // STEP 9 — PROFILE, ADDRESSES, RETURNS, REFUNDS & REPORTING
+  // =================================================================
+
+  const authHeader = (token) => ({ Authorization: `Bearer ${token}` });
+
+  // Test 49: Customer profile update cannot change protected fields
+  await runTest("Step 9: Customer Updates Permitted Profile Fields", async () => {
+    const res = await fetch(`${BASE_URL}/customer/me/`, {
+      method: "PATCH",
+      headers: {
+        "Content-Type": "application/json",
+        ...authHeader(customerAccessToken),
+      },
+      body: JSON.stringify({
+        first_name: "Updated Customer",
+        phone: "+8801700000009",
+        email: "attempted-change@example.com",
+        is_staff: true,
+      }),
+    });
+    assert(res.status === 200, `Expected 200 for profile update, got ${res.status}`);
+    const data = await res.json();
+    assert(data.first_name === "Updated Customer", "Permitted profile field was not updated");
+    assert(data.email === testEmail, "Customer email must remain immutable");
+    assert(data.is_staff === false, "Customer staff status must remain immutable");
+  });
+
+  let savedAddressId = "";
+  await runTest("Step 9: Customer Creates and Reads Saved Address", async () => {
+    const createRes = await fetch(`${BASE_URL}/customer/addresses/`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...authHeader(customerAccessToken),
+      },
+      body: JSON.stringify({
+        label: "Step 9 Home",
+        full_name: "Updated Customer",
+        phone: "+8801700000009",
+        address_line1: "House 10, Road 2",
+        city: "Dhaka",
+        country: "Bangladesh",
+        is_default: true,
+      }),
+    });
+    assert(createRes.status === 201, `Expected 201 for address creation, got ${createRes.status}`);
+    const created = await createRes.json();
+    assert(created.is_default === true, "New address should be default");
+    savedAddressId = created.id;
+
+    const listRes = await fetch(`${BASE_URL}/customer/addresses/`, {
+      headers: authHeader(customerAccessToken),
+    });
+    assert(listRes.status === 200, `Expected 200 for address list, got ${listRes.status}`);
+    const addresses = await listRes.json();
+    assert(addresses.some((address) => address.id === savedAddressId), "Created address missing from customer list");
+  });
+
+  await runTest("Step 9: Customer Return Request Uses Delivered Order Items", async () => {
+    const orderRes = await fetch(`${BASE_URL}/customer/orders/${fulfillmentOrderId}/`, {
+      headers: authHeader(customerAccessToken),
+    });
+    assert(orderRes.status === 200, `Expected delivered order detail, got ${orderRes.status}`);
+    const order = await orderRes.json();
+    assert(order.status === "delivered", `Expected delivered order, got ${order.status}`);
+    assert(order.items?.[0]?.id, "Delivered order item id is required for a return");
+
+    const returnRes = await fetch(`${BASE_URL}/customer/returns/`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...authHeader(customerAccessToken),
+      },
+      body: JSON.stringify({
+        order_public_id: fulfillmentOrderId,
+        reason: "Product arrived damaged",
+        items: [{ order_item_id: order.items[0].id, quantity: 1 }],
+      }),
+    });
+    assert(returnRes.status === 201, `Expected 201 for return request, got ${returnRes.status}`);
+    const returnData = await returnRes.json();
+    assert(returnData.status === "requested", `Expected requested return, got ${returnData.status}`);
+    assert(returnData.items?.[0]?.quantity === 1, "Return quantity was not recorded");
+  });
+
+  await runTest("Step 9: Staff Can Review Return With Explicit Transitions", async () => {
+    const listRes = await fetch(`${BASE_URL}/admin/returns/`, {
+      headers: authHeader(staffAccessToken),
+    });
+    assert(listRes.status === 200, `Expected 200 for admin returns, got ${listRes.status}`);
+    const payload = await listRes.json();
+    const request = payload.results?.find((item) => item.order_public_id === fulfillmentOrderId);
+    assert(request, "Return request was not visible to staff");
+
+    const approveRes = await fetch(`${BASE_URL}/admin/returns/${request.public_id}/approve/`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...authHeader(staffAccessToken),
+      },
+      body: JSON.stringify({ staff_note: "Approved for inspection" }),
+    });
+    assert(approveRes.status === 200, `Expected 200 for return approval, got ${approveRes.status}`);
+    assert((await approveRes.json()).status === "approved", "Return did not transition to approved");
+
+    const receiveRes = await fetch(`${BASE_URL}/admin/returns/${request.public_id}/receive/`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...authHeader(staffAccessToken),
+      },
+      body: JSON.stringify({ staff_note: "Received by warehouse" }),
+    });
+    assert(receiveRes.status === 200, `Expected 200 for return receipt, got ${receiveRes.status}`);
+    assert((await receiveRes.json()).status === "received", "Return did not transition to received");
+  });
+
+  await runTest("Step 9: Reporting Requires reports.read Permission", async () => {
+    const res = await fetch(`${BASE_URL}/admin/reports/orders/`, {
+      headers: authHeader(customerAccessToken),
+    });
+    assert(res.status === 403, `Expected 403 without reports.read, got ${res.status}`);
+  });
+
+  await runTest("Step 9: Internal Refund Endpoint Requires payments.refund Permission", async () => {
+    const res = await fetch(`${BASE_URL}/admin/refunds/`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...authHeader(customerAccessToken),
+      },
+      body: JSON.stringify({ payment_public_id: "00000000-0000-0000-0000-000000000000", amount: "1.00" }),
+    });
+    assert(res.status === 403, `Expected 403 without payments.refund, got ${res.status}`);
+  });
+
+  // =================================================================
   // CATALOG ARCHIVING & BR-05 CHECKS
   // =================================================================
 
