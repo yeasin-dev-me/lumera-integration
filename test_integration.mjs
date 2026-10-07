@@ -1392,6 +1392,120 @@ async function main() {
     assert(res.status === 204, `Expected 204 No Content for category archive but got ${res.status}`);
   });
 
+  // ============================================================================
+  // STEP 11 — CUSTOMER COMMUNICATION & ENGAGEMENT TESTS
+  // ============================================================================
+
+  // Test 53: Customer Communication Preferences Defaults
+  await runTest("Customer Retrieves Communication Preferences (/customer/communication-preferences/)", async () => {
+    const res = await fetch(`${BASE_URL}/customer/communication-preferences/`, {
+      headers: { Authorization: `Bearer ${customerAccessToken}` },
+    });
+    assert(res.status === 200, `Expected 200 OK for preferences but got ${res.status}`);
+    const data = await res.json();
+    assert(data.marketing_email === false, "Expected marketing_email default to be false");
+    assert(data.marketing_sms === false, "Expected marketing_sms default to be false");
+    assert(data.order_updates_email === true, "Expected order_updates_email to be true (transactional)");
+  });
+
+  // Test 54: Customer Updates Marketing Consent
+  await runTest("Customer Updates Marketing Consent (/customer/communication-preferences/)", async () => {
+    const res = await fetch(`${BASE_URL}/customer/communication-preferences/`, {
+      method: "PATCH",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${customerAccessToken}`,
+      },
+      body: JSON.stringify({
+        marketing_email: true,
+        marketing_sms: false,
+      }),
+    });
+    assert(res.status === 200, `Expected 200 OK for patch preferences but got ${res.status}`);
+    const data = await res.json();
+    assert(data.marketing_email === true, "Expected marketing_email to be updated to true");
+    assert(data.order_updates_email === true, "Transactional email must remain active");
+  });
+
+  // Test 55: Transactional Isolation - order_updates_email cannot be disabled
+  await runTest("Transactional Isolation: order_updates_email Remains Active", async () => {
+    const res = await fetch(`${BASE_URL}/customer/communication-preferences/`, {
+      method: "PATCH",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${customerAccessToken}`,
+      },
+      body: JSON.stringify({
+        order_updates_email: false,
+      }),
+    });
+    assert(res.status === 200, `Expected 200 OK but got ${res.status}`);
+    const data = await res.json();
+    assert(data.order_updates_email === true, "Transactional order updates cannot be opted out of");
+  });
+
+  // Test 56: Customer Notifications History
+  let firstNotificationId = null;
+  await runTest("Customer Views Dispatched Notification History (/customer/notifications/)", async () => {
+    const res = await fetch(`${BASE_URL}/customer/notifications/`, {
+      headers: { Authorization: `Bearer ${customerAccessToken}` },
+    });
+    assert(res.status === 200, `Expected 200 OK for customer notifications but got ${res.status}`);
+    const data = await res.json();
+    assert(Array.isArray(data.results), "Expected results to be an array");
+    if (data.results.length > 0) {
+      firstNotificationId = data.results[0].public_id;
+      assert(data.results[0].channel === "email", "Expected email channel");
+      assert(data.results[0].status === "sent" || data.results[0].status === "pending", "Expected sent or pending status");
+    }
+  });
+
+  // Test 57: Customer Isolation / Unauthorized Access
+  await runTest("Customer Isolation: Anonymous Cannot Access Notifications (401)", async () => {
+    const res = await fetch(`${BASE_URL}/customer/notifications/`);
+    assert(res.status === 401, `Expected 401 Unauthorized for anonymous notifications but got ${res.status}`);
+  });
+
+  // Test 58: Staff Operational Visibility into Dispatched Notifications
+  await runTest("Staff Inspects Operational Notifications (/admin/notifications/)", async () => {
+    const res = await fetch(`${BASE_URL}/admin/notifications/`, {
+      headers: { Authorization: `Bearer ${staffAccessToken}` },
+    });
+    assert(res.status === 200, `Expected 200 OK for admin notifications but got ${res.status}`);
+    const data = await res.json();
+    assert(Array.isArray(data.results), "Expected admin results array");
+    if (data.results.length > 0 && !firstNotificationId) {
+      firstNotificationId = data.results[0].public_id;
+    }
+  });
+
+  // Test 59: Staff Filters Notifications by Status and Event Type
+  await runTest("Staff Filters Notifications by Event Type (/admin/notifications/?event_type=...)", async () => {
+    const res = await fetch(`${BASE_URL}/admin/notifications/?event_type=account_welcome`, {
+      headers: { Authorization: `Bearer ${staffAccessToken}` },
+    });
+    assert(res.status === 200, `Expected 200 OK for filtered notifications but got ${res.status}`);
+    const data = await res.json();
+    assert(Array.isArray(data.results), "Expected results array");
+    for (const item of data.results) {
+      assert(item.event_type === "account_welcome", "Filtered items must match event_type");
+    }
+  });
+
+  // Test 60: Staff Resends Notification Safely
+  if (firstNotificationId) {
+    await runTest(`Staff Safely Resends Notification (/admin/notifications/${firstNotificationId}/resend/)`, async () => {
+      const res = await fetch(`${BASE_URL}/admin/notifications/${firstNotificationId}/resend/`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${staffAccessToken}` },
+      });
+      assert(res.status === 200, `Expected 200 OK for resend notification but got ${res.status}`);
+      const data = await res.json();
+      assert(data.status === "sent", "Expected resend status to be sent");
+      assert(data.attempt_count >= 2, `Expected attempt_count >= 2 but got ${data.attempt_count}`);
+    });
+  }
+
   console.log(`\n------------------------------------------------------------------`);
   console.log(` Results: ${passedTests}/${totalTests} integration tests passed.`);
   console.log(`------------------------------------------------------------------\n`);
