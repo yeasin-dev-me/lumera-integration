@@ -1261,6 +1261,99 @@ async function main() {
   });
 
   // =================================================================
+  // STEP 10 — CONTENT, SEO & MARKETING FOUNDATIONS
+  // =================================================================
+
+  let step10HeroPublicId = "";
+  const step10HeroSlug = `step10-botanical-hero-${Date.now()}`;
+  const step10DraftSlug = `step10-draft-${Date.now()}`;
+
+  await runTest("Step 10: Staff Creates and Publishes Content Block with Entity References", async () => {
+    const createRes = await fetch(`${BASE_URL}/admin/content/`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...authHeader(staffAccessToken),
+      },
+      body: JSON.stringify({
+        title: "Botanical Skin Renewal",
+        slug: step10HeroSlug,
+        content_type: "hero",
+        body: "Handcrafted pure botanical extracts for complete barrier recovery.",
+        image_url: "https://images.example.com/botanical-hero.jpg",
+        alt_text: "Botanical serum formulation",
+        cta_label: "Shop Rosehip",
+        cta_url: `/products/${productSlug}`,
+        linked_product_id: productId,
+        linked_category_slug: categorySlug,
+        status: "draft",
+        sort_order: 1,
+      }),
+    });
+    assert(createRes.status === 201, `Expected 201 for content block creation, got ${createRes.status}`);
+    const created = await createRes.json();
+    assert(created.status === "draft", "Content block should initially be draft");
+    step10HeroPublicId = created.public_id;
+
+    // Publish action transition
+    const pubRes = await fetch(`${BASE_URL}/admin/content/${step10HeroPublicId}/publish/`, {
+      method: "POST",
+      headers: authHeader(staffAccessToken),
+    });
+    assert(pubRes.status === 200, `Expected 200 for content publish, got ${pubRes.status}`);
+    assert((await pubRes.json()).status === "published", "Content block did not transition to published");
+  });
+
+  await runTest("Step 10: Storefront Home Content Exposes Published Hero and Safe Announcement", async () => {
+    const homeRes = await fetch(`${BASE_URL}/content/home/`);
+    assert(homeRes.status === 200, `Expected 200 for storefront home content, got ${homeRes.status}`);
+    const homeData = await homeRes.json();
+    assert(homeData.hero?.slug === step10HeroSlug, "Published hero block missing from home content");
+    assert(homeData.hero?.linked_category_slug === categorySlug, "Linked category slug missing from hero block");
+  });
+
+  await runTest("Step 10: Draft Content is Hidden from Public Storefront Endpoints (404)", async () => {
+    // Staff creates a draft block
+    const draftRes = await fetch(`${BASE_URL}/admin/content/`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...authHeader(staffAccessToken),
+      },
+      body: JSON.stringify({
+        title: "Confidential Draft Sale",
+        slug: step10DraftSlug,
+        content_type: "banner",
+        body: "Upcoming secret flash sale",
+        status: "draft",
+      }),
+    });
+    assert(draftRes.status === 201, `Expected 201 for draft content creation, got ${draftRes.status}`);
+
+    // Public endpoint returns 404 for draft content
+    const pubCheckRes = await fetch(`${BASE_URL}/content/${step10DraftSlug}/`);
+    assert(pubCheckRes.status === 404, `Expected 404 for draft content, got ${pubCheckRes.status}`);
+  });
+
+  await runTest("Step 10: Customer Cannot Access CMS Content Management (403 Forbidden)", async () => {
+    const res = await fetch(`${BASE_URL}/admin/content/`, {
+      headers: authHeader(customerAccessToken),
+    });
+    assert(res.status === 403, `Expected 403 without content.read, got ${res.status}`);
+  });
+
+  await runTest("Step 10: Storefront Config Exposes Whitelisted Marketing Keys Without Secrets", async () => {
+    const res = await fetch(`${BASE_URL}/storefront/config/`);
+    assert(res.status === 200, `Expected 200 for storefront config, got ${res.status}`);
+    const config = await res.json();
+    assert(config.site_name === "Lumera", "Expected site_name Lumera in public config");
+    assert("announcement_text" in config, "announcement_text must be in public config");
+    assert("meta_pixel_id" in config, "meta_pixel_id must be in public config");
+    assert("ga4_measurement_id" in config, "ga4_measurement_id must be in public config");
+    assert(!("SECRET_KEY" in config), "SECRET_KEY must never leak in public config");
+  });
+
+  // =================================================================
   // CATALOG ARCHIVING & BR-05 CHECKS
   // =================================================================
 
