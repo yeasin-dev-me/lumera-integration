@@ -1284,7 +1284,7 @@ async function main() {
         alt_text: "Botanical serum formulation",
         cta_label: "Shop Rosehip",
         cta_url: `/products/${productSlug}`,
-        linked_product_id: productId,
+        linked_product_id: productPublicId,
         linked_category_slug: categorySlug,
         status: "draft",
         sort_order: 1,
