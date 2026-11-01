@@ -4,6 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "test": "node test_integration.mjs"
+    "test": "node test_integration.mjs",
+    "test:navigation": "node test_navigation_and_curated_integration.mjs"
   }
 }
